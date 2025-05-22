@@ -1,253 +1,666 @@
-import pygame
-import sys
-import random
-from PIL import Image
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from PIL import Image, ImageTk
 import numpy as np
-from tkinter import filedialog, Tk
+import random
+import math
+import threading
+from queue import Queue
 from collections import deque
+import time
 
-pygame.init()
+class SmartCourierSimulator:
+    def __init__(self, master):
+        self.master = master
+        self.master.title("Smart Courier BFS Version")
+        self.master.geometry("1000x800")
 
-SCALE = 0.7
-WIDTH, HEIGHT = 0, 0
-SCALED_WIDTH, SCALED_HEIGHT = 0, 0
+        self.ROAD_COLOR_RANGE = ((90, 90, 90), (150, 150, 150))
+        self.SOURCE_COLOR = "#4CAF50"
+        self.DESTINATION_COLOR = "#F44336"
+        self.COURIER_COLOR = "#2196F3"
+        self.PATH_COLOR = "#9C27B0"
 
-WHITE = (255, 255, 255)
-GRAY = (120, 120, 120)
-BLACK = (0, 0, 0)
-RED = (255, 0, 0)
-YELLOW = (255, 255, 0)
-BLUE = (0, 0, 255)
+        self.COURIER_SIZE = 20
+        self.FLAG_SIZE = 12
+        self.PATH_WIDTH = 3
 
-map_img = None
-original_img = None
-SCREEN = None
+        self.setup_ui()
+        self.reset_state()
+        self.gui_queue = Queue()
+        self.last_frame_time = time.time()
+        self.frame_count = 0
+        self.fps = 0
+        self.check_queue()
 
-kurir_pos = [100, 100]
-kurir_angle = 0
-source_pos = [200, 200]
-dest_pos = [800, 600]
-kurir_speed = 0.5
-is_moving = False
-sudah_ambil = False
-paket_diterima = False
-use_manual_control = True
-kurir_visible = True
-tugas_selesai = False
-status_text = ""
+    def setup_ui(self):
+        self.control_frame = tk.Frame(self.master, bg="#f0f0f0", padx=10, pady=10)
+        self.control_frame.pack(fill=tk.X)
 
-def scale_pos(pos):
-    return [int(pos[0] * SCALE), int(pos[1] * SCALE)]
+        tk.Button(self.control_frame, text="Load Map", command=self.load_map, bg="#607D8B", fg="white").pack(side=tk.LEFT, padx=5)
+        tk.Button(self.control_frame, text="Random Positions", command=lambda: threading.Thread(target=self.place_flags_threaded, daemon=True).start(), bg="#795548", fg="white").pack(side=tk.LEFT, padx=5)
+        tk.Button(self.control_frame, text="Start Delivery", command=lambda: threading.Thread(target=self.start_delivery_threaded, daemon=True).start(), bg="#4CAF50", fg="white").pack(side=tk.LEFT, padx=5)
+        tk.Button(self.control_frame, text="Stop", command=self.stop_delivery, bg="#F44336", fg="white").pack(side=tk.LEFT, padx=5)
 
-def load_map(file_path):
-    global map_img, original_img, WIDTH, HEIGHT, SCALED_WIDTH, SCALED_HEIGHT, SCREEN
-    pil_img = Image.open(file_path).convert("RGB")
-    original_img = pil_img.copy()
-    WIDTH, HEIGHT = pil_img.size
-    SCALED_WIDTH, SCALED_HEIGHT = int(WIDTH * SCALE), int(HEIGHT * SCALE)
-    map_img = pygame.image.fromstring(pil_img.tobytes(), pil_img.size, pil_img.mode)
-    SCREEN = pygame.display.set_mode((SCALED_WIDTH, SCALED_HEIGHT))
+        tk.Label(self.control_frame, text="Speed:", bg="#f0f0f0").pack(side=tk.LEFT, padx=(20, 5))
+        self.speed_scale = tk.Scale(self.control_frame, from_=1, to=30, orient=tk.HORIZONTAL, bg="#f0f0f0")
+        self.speed_scale.set(10)
+        self.speed_scale.pack(side=tk.LEFT)
 
-def is_road(color):
-    r, g, b = color
-    return 90 <= r <= 150 and 90 <= g <= 150 and 90 <= b <= 150
+        self.status_frame = tk.Frame(self.master, bg="#333", height=30)
+        self.status_frame.pack(fill=tk.X)
+        self.status_label = tk.Label(self.status_frame, text="Status: Ready | FPS: 0", fg="white", bg="#333")
+        self.status_label.pack(side=tk.LEFT, padx=10)
 
-def get_pixel_color(pos):
-    x, y = round(pos[0]), round(pos[1])
-    if 0 <= x < WIDTH and 0 <= y < HEIGHT:
-        return original_img.getpixel((x, y))
-    return (0, 0, 0)
+        self.canvas = tk.Canvas(self.master, width=900, height=700, bg="#333")
+        self.canvas.pack(pady=(0, 10))
 
-def random_road_position():
-    while True:
-        x = random.randint(0, WIDTH - 1)
-        y = random.randint(0, HEIGHT - 1)
-        if is_road(get_pixel_color((x, y))):
-            return [x, y]
+    def reset_state(self):
+        self.image = None
+        self.image_tk = None
+        self.map_array = None
+        self.original_size = None
+        self.source = None
+        self.destination = None
+        self.courier = None
+        self.courier_angle = 90
+        self.smooth_angle = 90
+        self.target_angle = 90
+        self.interp_pos = None
+        self.prev_pos = None
+        self.path = []
+        self.road_pixels = []
+        self.road_set = set()
+        self.delivery_in_progress = False
+        self.current_step = 0
+        self.animation_id = None
 
-def randomize_positions():
-    global kurir_pos, source_pos, dest_pos, sudah_ambil, paket_diterima, tugas_selesai, status_text
-    source_pos = random_road_position()
-    dest_pos = random_road_position()
-    kurir_pos = source_pos.copy()
-    sudah_ambil = False
-    paket_diterima = False
-    tugas_selesai = False
-    status_text = "Ambil Paket"
-    print(f"Source: {source_pos}, Destination: {dest_pos}")
+    def check_queue(self):
+        try:
+            while True:
+                task = self.gui_queue.get_nowait()
+                task()
+        except:
+            pass
+        self.frame_count += 1
+        current_time = time.time()
+        if current_time - self.last_frame_time >= 1.0:
+            self.fps = self.frame_count
+            self.frame_count = 0
+            self.last_frame_time = current_time
+            self.update_fps()
+        self.master.after(10, self.check_queue)
 
-def draw_kurir(surface, pos, angle):
-    if not kurir_visible:
-        return
-    x, y = scale_pos(pos)
-    size = 4
-    points = [
-        (x + size * np.cos(np.radians(angle)), y - size * np.sin(np.radians(angle))),
-        (x + size * np.cos(np.radians(angle + 135)), y - size * np.sin(np.radians(angle + 135))),
-        (x + size * np.cos(np.radians(angle - 135)), y - size * np.sin(np.radians(angle - 135)))
-    ]
-    pygame.draw.polygon(surface, BLACK, points)
+    def update_fps(self):
+        current_text = self.status_label.cget("text")
+        if "FPS:" in current_text:
+            current_text = current_text.split("| FPS:")[0].strip()
+        self.status_label.config(text=f"{current_text} | FPS: {self.fps}")
 
-def load_image():
-    root = Tk()
-    root.withdraw()
-    file_path = filedialog.askopenfilename(filetypes=[("Image files", "*.jpg *.png")])
-    if file_path:
-        load_map(file_path)
-        randomize_positions()
-        print(f"Map dimuat dari: {file_path}")
-        print(f"Source: {source_pos}, Destination: {dest_pos}")
+    def load_map(self):
+        if self.delivery_in_progress:
+            return
+        file_path = filedialog.askopenfilename(filetypes=[("Image files", "*.png;*.jpg;*.jpeg")])
+        if not file_path:
+            return
+        try:
+            img = Image.open(file_path).convert("RGB")
+            self.map_array = np.array(img)
+            self.original_size = img.size
+            img.thumbnail((900, 700), Image.LANCZOS)
+            self.image = img
+            self.image_tk = ImageTk.PhotoImage(self.image)
+            self.road_pixels = self.get_road_pixels()
+            self.road_set = set(self.road_pixels)
+            self.canvas.delete("all")
+            self.canvas.config(width=self.image.width, height=self.image.height)
+            self.canvas.create_image(0, 0, anchor=tk.NW, image=self.image_tk)
+            self.update_status("Map loaded")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
 
-def bfs(start, goal):
-    queue = deque([(start, [])])
-    visited = set()
-    visited.add(tuple(start))
-    while queue:
-        current_pos, path = queue.popleft()
-        if current_pos == goal:
-            return path
-        for dx, dy in [(-1,0), (1,0), (0,-1), (0,1)]:
-            next_pos = [current_pos[0]+dx, current_pos[1]+dy]
-            if is_road(get_pixel_color(next_pos)) and tuple(next_pos) not in visited:
-                visited.add(tuple(next_pos))
-                queue.append((next_pos, path + [next_pos]))
-    return []
+    def get_road_pixels(self):
+        min_rgb, max_rgb = self.ROAD_COLOR_RANGE
+        road_mask = (
+            (self.map_array[:,:,0] >= min_rgb[0]) & (self.map_array[:,:,0] <= max_rgb[0]) &
+            (self.map_array[:,:,1] >= min_rgb[1]) & (self.map_array[:,:,1] <= max_rgb[1]) &
+            (self.map_array[:,:,2] >= min_rgb[2]) & (self.map_array[:,:,2] <= max_rgb[2])
+        )
+        return list(zip(*np.where(road_mask)))
 
-def is_facing_toward(kurir_pos, target_pos, kurir_angle):
-    dx = target_pos[0] - kurir_pos[0]
-    dy = target_pos[1] - kurir_pos[1]
-    angle_to_target = np.degrees(np.arctan2(-dy, dx)) % 360
-    return abs((kurir_angle - angle_to_target + 180) % 360 - 180) < 45
+    def place_flags_threaded(self):
+        if self.delivery_in_progress or not self.road_pixels:
+            return
+        for _ in range(10):
+            self.source = random.choice(self.road_pixels)
+            self.destination = random.choice(self.road_pixels)
+            self.courier = random.choice(self.road_pixels)
+            if self.source != self.destination and self.source != self.courier:
+                if self.bfs_pathfinding(self.courier, self.source) and self.bfs_pathfinding(self.source, self.destination):
+                    break
+        self.draw_flag(self.source, self.SOURCE_COLOR)
+        self.draw_flag(self.destination, self.DESTINATION_COLOR)
+        self.draw_courier()
+        self.update_status("Positions set")
 
-def update_kurir_angle(kurir_pos, target_pos):
-    dx = target_pos[0] - kurir_pos[0]
-    dy = target_pos[1] - kurir_pos[1]
-    return np.degrees(np.arctan2(-dy, dx)) % 360
+    def draw_flag(self, position, color):
+        y, x = position
+        scale_x = self.image.width / self.original_size[0]
+        scale_y = self.image.height / self.original_size[1]
+        cx = x * scale_x
+        cy = y * scale_y
+        self.canvas.create_oval(cx - self.FLAG_SIZE, cy - self.FLAG_SIZE, cx + self.FLAG_SIZE, cy + self.FLAG_SIZE, fill=color, outline="black")
 
-def move_kurir(kurir_pos, kurir_angle, speed):
-    dx = speed * np.cos(np.radians(kurir_angle))
-    dy = -speed * np.sin(np.radians(kurir_angle))
-    new_pos = [kurir_pos[0] + dx, kurir_pos[1] + dy]
-    if is_road(get_pixel_color(new_pos)):
-        return new_pos
-    return kurir_pos
-
-def draw_button(surface, rect, text, font):
-    pygame.draw.rect(surface, GRAY, rect)
-    text_surf = font.render(text, True, BLACK)
-    text_rect = text_surf.get_rect(center=rect.center)
-    surface.blit(text_surf, text_rect)
-
-def draw_path(surface, path):
-    if len(path) >= 2:
-        for i in range(len(path) - 1):
-            pygame.draw.line(surface, GRAY, scale_pos(path[i]), scale_pos(path[i+1]), 1)
-
-def main():
-    global kurir_pos, kurir_angle, is_moving, sudah_ambil, use_manual_control, kurir_visible
-    global kurir_speed, paket_diterima, status_text, tugas_selesai
-
-    kurir_speed = 0.5
-
-    try:
-        load_map("assets/map.jpg")
-    except:
-        print("File 'assets/map.jpg' tidak ditemukan.")
-        sys.exit()
-
-    font = pygame.font.SysFont(None, 30)
-    btn_reset = pygame.Rect(20, 20, 160, 40)
-    btn_load_map = pygame.Rect(200, 20, 160, 40)
-    btn_start = pygame.Rect(380, 20, 160, 40)
-
-    randomize_positions()
-    clock = pygame.time.Clock()
-    path = []
-    path_index = 0
-    running = True
-
-    while running:
-        clock.tick(60)
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-            if event.type == pygame.MOUSEBUTTONDOWN:
-                if btn_reset.collidepoint(event.pos):
-                    randomize_positions()
-                    path = []
-                    paket_diterima = False
-                elif btn_load_map.collidepoint(event.pos):
-                    load_image()
-                    path = []
-                    paket_diterima = False
-                elif btn_start.collidepoint(event.pos):
-                    if is_road(get_pixel_color(kurir_pos)) and is_road(get_pixel_color(dest_pos)):
-                        path = bfs(kurir_pos, dest_pos)
-                        path_index = 0
-                        if not path:
-                            status_text = "Jalur tidak ditemukan!"
-                        else:
-                            use_manual_control = False
-                            status_text = "Menuju Tujuan"
-
-        if path and path_index < len(path):
-            next_pos = path[path_index]
-            if np.linalg.norm(np.array(kurir_pos) - np.array(next_pos)) >= 1:
-                kurir_angle = update_kurir_angle(kurir_pos, next_pos)
-                kurir_pos = move_kurir(kurir_pos, kurir_angle, kurir_speed)
-            if np.linalg.norm(np.array(kurir_pos) - np.array(next_pos)) < 2:
-                kurir_pos = next_pos
-                path_index += 1
-            is_moving = True
+    def draw_courier(self):
+        if not self.courier:
+            return
+        if self.prev_pos and not self.interp_pos:
+            self.interp_pos = self.prev_pos
+        if self.interp_pos:
+            y = self.interp_pos[0] + (self.courier[0] - self.interp_pos[0]) * 0.3
+            x = self.interp_pos[1] + (self.courier[1] - self.interp_pos[1]) * 0.3
+            self.interp_pos = (y, x)
         else:
-            is_moving = False
+            y, x = self.courier
+        scale_x = self.image.width / self.original_size[0]
+        scale_y = self.image.height / self.original_size[1]
+        cx = x * scale_x
+        cy = y * scale_y
+        self.canvas.delete("courier")
+        angle_diff = (self.target_angle - self.smooth_angle + 180) % 360 - 180
+        self.smooth_angle = (self.smooth_angle + angle_diff * 0.2) % 360
+        angle_rad = math.radians(self.smooth_angle)
+        size = self.COURIER_SIZE
+        points = [
+            cx + size * math.cos(angle_rad),
+            cy - size * math.sin(angle_rad),
+            cx + size * 0.7 * math.cos(angle_rad + math.pi * 0.8),
+            cy - size * 0.7 * math.sin(angle_rad + math.pi * 0.8),
+            cx + size * 0.7 * math.cos(angle_rad - math.pi * 0.8),
+            cy - size * 0.7 * math.sin(angle_rad - math.pi * 0.8),
+        ]
+        self.canvas.create_polygon(points, fill=self.COURIER_COLOR, outline="white", width=2, tags="courier")
 
-        if not sudah_ambil and np.linalg.norm(np.array(kurir_pos) - np.array(source_pos)) < 5:
-            if is_facing_toward(kurir_pos, source_pos, kurir_angle):
-                sudah_ambil = True
-                status_text = "Mengantar Paket"
-                print("Paket berhasil diambil.")
+    def bfs_pathfinding(self, start, goal):
+        if start == goal:
+            return []
+        queue = deque([start])
+        visited = set([start])
+        came_from = {}
+        rows, cols = self.map_array.shape[:2]
+        while queue:
+            current = queue.popleft()
+            if current == goal:
+                path = []
+                while current in came_from:
+                    path.append(current)
+                    current = came_from[current]
+                path.reverse()
+                return path
+            for dy, dx in [(0, 1), (1, 0), (0, -1), (-1, 0)]:
+                neighbor = (current[0] + dy, current[1] + dx)
+                if (0 <= neighbor[0] < rows and 0 <= neighbor[1] < cols and neighbor in self.road_set and neighbor not in visited):
+                    queue.append(neighbor)
+                    visited.add(neighbor)
+                    came_from[neighbor] = current
+        return []
+
+    def start_delivery_threaded(self):
+        if self.delivery_in_progress or not self.courier:
+            return
+        self.delivery_in_progress = True
+        self.path = self.bfs_pathfinding(self.courier, self.source)
+        self.current_step = 0
+        self.prev_pos = self.courier
+        self.interp_pos = self.courier
+        self.animate_path("pickup")
+
+    def animate_path(self, stage):
+        if not self.delivery_in_progress:
+            return
+        if self.current_step < len(self.path):
+            next_pos = self.path[self.current_step]
+            self.prev_pos = self.courier
+            self.target_angle = self.get_direction_to(next_pos)
+            self.courier = next_pos
+            self.current_step += 1
+            self.gui_queue.put(lambda: self.draw_courier())
+            delay = max(10, int(100 / self.speed_scale.get()))
+            self.animation_id = self.master.after(delay, lambda: self.animate_path(stage))
+        else:
+            if stage == "pickup":
+                self.path = self.bfs_pathfinding(self.courier, self.destination)
+                self.current_step = 0
+                self.animate_path("delivery")
             else:
-                status_text = "Dekat Source - Hadapkan Kurir!"
+                self.delivery_in_progress = False
+                self.update_status("Delivery complete")
+                messagebox.showinfo("Success", "Package delivered!")
 
-        if sudah_ambil and np.linalg.norm(np.array(kurir_pos) - np.array(dest_pos)) < 5:
-            if is_facing_toward(kurir_pos, dest_pos, kurir_angle) and not paket_diterima:
-                paket_diterima = True
-                tugas_selesai = True
-                status_text = "Tugas Selesai!"
-                print("Paket berhasil diterima.")
-            else:
-                status_text = "Dekat Tujuan - Hadapkan Kurir!"
+    def get_direction_to(self, target_pos):
+        dy = target_pos[0] - self.courier[0]
+        dx = target_pos[1] - self.courier[1]
+        return math.degrees(math.atan2(-dy, dx)) % 360 if dx or dy else self.target_angle
 
-        if not is_moving and sudah_ambil and not use_manual_control and not paket_diterima:
-            path = bfs(kurir_pos, dest_pos)
-            path_index = 0
+    def stop_delivery(self):
+        if self.animation_id:
+            self.master.after_cancel(self.animation_id)
+            self.animation_id = None
+        self.delivery_in_progress = False
+        self.update_status("Delivery stopped")
 
-        SCREEN.fill(WHITE)
-        SCREEN.blit(pygame.transform.scale(map_img, (SCALED_WIDTH, SCALED_HEIGHT)), (0, 0))
-        pygame.draw.circle(SCREEN, YELLOW, scale_pos(source_pos), 6)
-        pygame.draw.circle(SCREEN, RED, scale_pos(dest_pos), 6)
-
-        if path:
-            draw_path(SCREEN, path)
-        draw_kurir(SCREEN, kurir_pos, kurir_angle)
-
-        draw_button(SCREEN, btn_reset, "Reset Posisi", font)
-        draw_button(SCREEN, btn_load_map, "Load Peta", font)
-        draw_button(SCREEN, btn_start, "Mulai", font)
-
-        # Status teks
-        status_surface = font.render(status_text, True, BLUE)
-        SCREEN.blit(status_surface, (600, 30))
-
-        if tugas_selesai:
-            selesai_text = font.render("Tugas Selesai!", True, (0, 128, 0))
-            SCREEN.blit(selesai_text, (600, 60))
-
-        pygame.display.update()
-
-    pygame.quit()
-    sys.exit()
+    def update_status(self, message):
+        current_text = self.status_label.cget("text")
+        if "FPS:" in current_text:
+            fps_part = current_text.split("| FPS:")[1].strip()
+            self.status_label.config(text=f"Status: {message} | FPS: {fps_part}")
+        else:
+            self.status_label.config(text=f"Status: {message}")
 
 if __name__ == "__main__":
-    main()
+    root = tk.Tk()
+    app = SmartCourierSimulator(root)
+    root.mainloop()
+
+            
+        if not self.road_pixels:
+            self.gui_queue.put(lambda: messagebox.showerror("Error", "No valid road pixels found in the map"))
+            return
+            
+        self.gui_queue.put(lambda: self.canvas.delete("all"))
+        if self.image_tk:
+            self.gui_queue.put(lambda: self.canvas.create_image(0, 0, anchor=tk.NW, image=self.image_tk))
+        
+        if self.animation_id:
+            self.master.after_cancel(self.animation_id)
+            self.animation_id = None
+        if self.rotation_id:
+            self.master.after_cancel(self.rotation_id)
+            self.rotation_id = None
+        
+        max_attempts = 10
+        valid_positions_found = False
+        
+        for attempt in range(max_attempts):
+            self.source = random.choice(self.road_pixels)
+            self.destination = random.choice(self.road_pixels)
+            while self.destination == self.source:
+                self.destination = random.choice(self.road_pixels)
+                
+            self.courier = random.choice(self.road_pixels)
+            while self.courier == self.source or self.courier == self.destination:
+                self.courier = random.choice(self.road_pixels)
+                
+            self.courier_angle = random.choice(list(self.DIRECTIONS.keys()))
+            self.target_angle = self.courier_angle
+            self.smooth_angle = self.courier_angle
+            self.has_package = False
+            self.current_step = 0
+            self.prev_pos = None
+            self.interp_pos = None
+            
+            path_to_source = self.optimized_a_star(self.courier, self.source)
+            if not path_to_source:
+                continue
+                
+            path_to_dest = self.optimized_a_star(self.source, self.destination)
+            if path_to_dest:
+                valid_positions_found = True
+                break
+                
+        if not valid_positions_found:
+            self.gui_queue.put(lambda: messagebox.showerror(
+                "Position Error",
+                "Couldn't find valid positions with connecting paths after 10 attempts."
+            ))
+            return
+            
+        self.gui_queue.put(lambda: self.draw_flag(self.source, self.SOURCE_COLOR, "source"))
+        self.gui_queue.put(lambda: self.draw_flag(self.destination, self.DESTINATION_COLOR, "destination"))
+        self.gui_queue.put(lambda: self.draw_courier())
+        
+        self.gui_queue.put(lambda: self.update_status("Positions placed | Ready to deliver"))
+    
+    def draw_flag(self, position, color, tag):
+        """Draw a flag marker at specified position"""
+        if self.image is None:
+            return
+            
+        orig_y, orig_x = position
+        scale_x = self.image.width / self.original_size[0]
+        scale_y = self.image.height / self.original_size[1]
+        x = orig_x * scale_x
+        y = orig_y * scale_y
+        
+        self.canvas.create_oval(
+            x - self.FLAG_SIZE, y - self.FLAG_SIZE,
+            x + self.FLAG_SIZE, y + self.FLAG_SIZE,
+            fill=color, outline="black", tags=tag
+        )
+        
+        self.canvas.create_line(
+            x, y,
+            x, y - self.FLAG_SIZE * 2,
+            fill="black", width=2, tags=tag
+        )
+    
+    def draw_courier(self):
+        """Draw the courier with smooth interpolation and optimized rendering"""
+        if self.image is None or self.courier is None:
+            return
+            
+        # Calculate interpolated position for smooth movement
+        if self.prev_pos and self.interp_pos is None:
+            self.interp_pos = self.prev_pos
+            
+        if self.interp_pos:
+            # Smooth interpolation
+            orig_y = self.interp_pos[0] + (self.courier[0] - self.interp_pos[0]) * self.interp_factor
+            orig_x = self.interp_pos[1] + (self.courier[1] - self.interp_pos[1]) * self.interp_factor
+            self.interp_pos = (orig_y, orig_x)
+        else:
+            orig_y, orig_x = self.courier
+        
+        scale_x = self.image.width / self.original_size[0]
+        scale_y = self.image.height / self.original_size[1]
+        x = orig_x * scale_x
+        y = orig_y * scale_y
+        
+        self.canvas.delete("courier")
+        
+        # Smooth angle transition
+        angle_diff = (self.target_angle - self.smooth_angle + 180) % 360 - 180
+        self.smooth_angle = (self.smooth_angle + angle_diff * 0.2) % 360
+        
+        # Pre-calculate triangle points for maximum speed
+        angle_rad = math.radians(self.smooth_angle)
+        size = self.COURIER_SIZE
+        points = [
+            x + size * math.cos(angle_rad),  # Front point
+            y - size * math.sin(angle_rad),
+            x + size * 0.7 * math.cos(angle_rad + math.pi * 0.8),  # Rear left
+            y - size * 0.7 * math.sin(angle_rad + math.pi * 0.8),
+            x + size * 0.7 * math.cos(angle_rad - math.pi * 0.8),  # Rear right
+            y - size * 0.7 * math.sin(angle_rad - math.pi * 0.8)
+        ]
+        
+        self.canvas.create_polygon(
+            points,
+            fill=self.COURIER_COLOR,
+            outline="white",
+            width=2,
+            tags="courier"
+        )
+        
+        if self.has_package:
+            self.canvas.create_text(
+                x, y - size - 15,
+                text="📦", font=("Arial", 14), tags="courier"
+            )
+    
+    def draw_path(self, path):
+        """Visualize the path on the canvas with optimized rendering"""
+        if not path or len(path) < 2:
+            return
+            
+        self.canvas.delete("path")
+        
+        scale_x = self.image.width / self.original_size[0]
+        scale_y = self.image.height / self.original_size[1]
+        
+        # Pre-calculate all points for faster line drawing
+        points = []
+        for y, x in path:
+            points.append(x * scale_x)
+            points.append(y * scale_y)
+        
+        self.canvas.create_line(
+            *points,
+            fill=self.PATH_COLOR,
+            width=self.PATH_WIDTH,
+            tags="path"
+        )
+    
+    def start_delivery_threaded(self):
+        """Threaded version of start_delivery with optimized pathfinding"""
+        if self.delivery_in_progress:
+            return
+            
+        if (self.map_array is None or 
+            self.source is None or 
+            self.destination is None or 
+            self.courier is None):
+            self.gui_queue.put(lambda: messagebox.showerror("Error", "Please load map and place positions first"))
+            return
+            
+        self.delivery_in_progress = True
+        self.current_step = 0
+        self.prev_pos = self.courier
+        self.interp_pos = self.courier
+        self.gui_queue.put(lambda: self.update_status("Starting delivery..."))
+        
+        if not self.has_package:
+            # Going to pick up package
+            self.path = self.optimized_a_star(self.courier, self.source)
+            if not self.path:
+                self.gui_queue.put(lambda: messagebox.showerror("Error", "No path found to source"))
+                self.delivery_in_progress = False
+                return
+                
+            self.gui_queue.put(lambda: self.draw_path(self.path))
+            self.ultra_fast_animate("source")
+        else:
+            # Already has package, go to destination
+            self.path = self.optimized_a_star(self.courier, self.destination)
+            if not self.path:
+                self.gui_queue.put(lambda: messagebox.showerror("Error", "No path found to destination"))
+                self.delivery_in_progress = False
+                return
+                
+            self.gui_queue.put(lambda: self.draw_path(self.path))
+            self.ultra_fast_animate("destination")
+    
+    def ultra_fast_animate(self, target):
+        """Optimized movement animation with smooth transitions"""
+        if not self.delivery_in_progress:
+            return
+            
+        # Update position in chunks based on speed
+        speed = self.speed_scale.get()
+        step_size = min(1 + speed // 5, len(self.path) - self.current_step - 1)
+        
+        # Store previous position for interpolation
+        self.prev_pos = self.courier
+        
+        # Move forward in the path
+        if self.current_step + step_size < len(self.path):
+            self.courier = self.path[self.current_step + step_size]
+            self.current_step += step_size
+        else:
+            self.courier = self.path[-1]
+            self.current_step = len(self.path) - 1
+        
+        # Update direction based on next few steps to prevent jitter at intersections
+        look_ahead = min(5, len(self.path) - self.current_step - 1)
+        if look_ahead > 0:
+            next_pos = self.path[self.current_step + look_ahead]
+            self.target_angle = self.get_direction_to(next_pos)
+        
+        # Update display
+        self.gui_queue.put(lambda: self.canvas.delete("courier"))
+        self.gui_queue.put(lambda: self.draw_courier())
+        
+        # Calculate delay - exponential scaling for speed
+        delay = max(0, int(30 / (speed ** 0.7)))
+        
+        if self.current_step < len(self.path) - 1:
+            self.animation_id = self.master.after(delay, lambda: self.ultra_fast_animate(target))
+        else:
+            self.handle_delivery_complete(target)
+    
+    def get_direction_to(self, position):
+        """Optimized direction calculation with smoothing"""
+        dy = position[0] - self.courier[0]
+        dx = position[1] - self.courier[1]
+        
+        if dx == 0 and dy == 0:
+            return self.target_angle
+            
+        return math.degrees(math.atan2(-dy, dx)) % 360
+    
+    def get_direction_to_target(self, target_pos):
+        """Optimized facing direction calculation"""
+        cy, cx = self.courier
+        ty, tx = target_pos
+        dy = ty - cy
+        dx = tx - cx
+        
+        if dx == 0 and dy == 0:
+            return self.target_angle
+            
+        return math.degrees(math.atan2(-dy, dx)) % 360
+    
+    def optimized_a_star(self, start, goal):
+        """Extremely optimized A* pathfinding algorithm"""
+        if start == goal:
+            return []
+            
+        if abs(start[0] - goal[0]) + abs(start[1] - goal[1]) == 1:
+            return [goal]
+            
+        if not (start in self.road_set and goal in self.road_set):
+            return []
+            
+        # Check if we can use a straight line (faster than A*)
+        if self.check_straight_line(start, goal):
+            return self.bresenham_line(start, goal)
+            
+        # Otherwise use optimized A*
+        rows, cols = self.map_array.shape[:2]
+        open_set = []
+        heapq.heappush(open_set, (0, start))
+        came_from = {}
+        g_score = {start: 0}
+        f_score = {start: self.chebyshev_heuristic(start, goal)}
+        
+        open_set_hash = {start}
+        
+        while open_set:
+            _, current = heapq.heappop(open_set)
+            open_set_hash.remove(current)
+            
+            if current == goal:
+                path = []
+                while current in came_from:
+                    path.append(current)
+                    current = came_from[current]
+                path.reverse()
+                return path
+                
+            # Check neighbors in optimal order (right, down, left, up)
+            for dy, dx in [(0, 1), (1, 0), (0, -1), (-1, 0)]:
+                neighbor = (current[0] + dy, current[1] + dx)
+                
+                if 0 <= neighbor[0] < rows and 0 <= neighbor[1] < cols:
+                    if neighbor in self.road_set:
+                        tentative_g = g_score[current] + 1
+                        
+                        if neighbor not in g_score or tentative_g < g_score[neighbor]:
+                            came_from[neighbor] = current
+                            g_score[neighbor] = tentative_g
+                            f_score[neighbor] = tentative_g + self.chebyshev_heuristic(neighbor, goal)
+                            if neighbor not in open_set_hash:
+                                heapq.heappush(open_set, (f_score[neighbor], neighbor))
+                                open_set_hash.add(neighbor)
+        
+        return []
+    
+    def check_straight_line(self, start, goal):
+        """Check if a straight line path exists between two points"""
+        # Simple check - only works for perfectly straight lines
+        if start[0] == goal[0] or start[1] == goal[1]:
+            return True
+        return False
+    
+    def bresenham_line(self, start, goal):
+        """Bresenham's line algorithm for straight paths"""
+        x0, y0 = start[1], start[0]
+        x1, y1 = goal[1], goal[0]
+        points = []
+        
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        x, y = x0, y0
+        sx = -1 if x0 > x1 else 1
+        sy = -1 if y0 > y1 else 1
+        
+        if dx > dy:
+            err = dx / 2.0
+            while x != x1:
+                points.append((y, x))
+                err -= dy
+                if err < 0:
+                    y += sy
+                    err += dx
+                x += sx
+        else:
+            err = dy / 2.0
+            while y != y1:
+                points.append((y, x))
+                err -= dx
+                if err < 0:
+                    x += sx
+                    err += dy
+                y += sy
+        
+        points.append((y1, x1))
+        return points
+    
+    def chebyshev_heuristic(self, a, b):
+        """Optimized Chebyshev distance heuristic"""
+        return max(abs(a[0] - b[0]), abs(a[1] - b[1]))
+    
+    def handle_delivery_complete(self, target):
+        """Handle completion of delivery stage"""
+        if target == "source":
+            self.has_package = True
+            self.gui_queue.put(lambda: self.update_status("Package picked up"))
+            
+            # Face the source when picking up
+            self.target_angle = self.get_direction_to_target(self.source)
+            
+            # Start delivery to destination
+            self.path = self.optimized_a_star(self.courier, self.destination)
+            if not self.path:
+                self.gui_queue.put(lambda: messagebox.showerror("Error", "No path found to destination"))
+                self.delivery_in_progress = False
+                return
+                
+            self.current_step = 0
+            self.prev_pos = self.courier
+            self.interp_pos = self.courier
+            self.gui_queue.put(lambda: self.draw_path(self.path))
+            self.ultra_fast_animate("destination")
+            
+        elif target == "destination":
+            # Face the destination when delivering
+            self.target_angle = self.get_direction_to_target(self.destination)
+            
+            self.has_package = False
+            self.gui_queue.put(lambda: self.update_status("Delivery successful!"))
+            self.gui_queue.put(lambda: messagebox.showinfo("Success", "Package delivered successfully!"))
+            self.delivery_in_progress = False
+    
+    def update_status(self, message):
+        """Update status label"""
+        current_text = self.status_label.cget("text")
+        if "FPS:" in current_text:
+            fps_part = current_text.split("| FPS:")[1].strip()
+            self.status_label.config(text=f"Status: {message} | FPS: {fps_part}")
+        else:
+            self.status_label.config(text=f"Status: {message}")
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = SmartCourierSimulator(root)
+    root.mainloop()
